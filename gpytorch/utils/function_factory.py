@@ -2,6 +2,7 @@ from torch.autograd import Function
 from .lincg import LinearCG
 from .lanczos_quadrature import StochasticLQ
 from .trace import trace_components
+from gpytorch.utils import tridiag_batch_potrf, tridiag_batch_potrs
 import torch
 import math
 
@@ -313,3 +314,93 @@ def exact_gp_mll_factory(matmul_closure_factory=_default_matmul_closure_factory,
             return tuple(closure_arg_grads + [labels_grad])
 
     return ExactGPMLL
+
+
+def root_decomposition_factory(matmul_closure_factory=_default_matmul_closure_factory,
+                               derivative_quadratic_form_factory=_default_derivative_quadratic_form_factory):
+    class RootDecomposition(Function):
+        def __init__(self, size, max_iter):
+            self.size = size
+            self.max_iter = max_iter
+
+        def forward(self, *args):
+            z = args[0].new(self.size, 1).normal_()
+            z = z / torch.norm(z, 2, 0)
+
+            def tensor_matmul_closure(rhs):
+                return matmul_closure_factory(*args)(rhs)
+
+            slq = StochasticLQ(cls=type(z), max_iter=self.max_iter)
+            q_mat, t_mat = slq.lanczos_batch(tensor_matmul_closure, z)
+            q_mat = q_mat[0]
+            t_mat = t_mat[0]
+
+            is_batch = True
+            if t_mat.ndimension() == 2:
+                is_batch = False
+                q_mat = q_mat.unsqueeze(0)
+                t_mat = t_mat.unsqueeze(0)
+
+            t_mat_cpu = t_mat.cpu()
+            last_proper = t_mat.size(-1)
+            for i in range(t_mat_cpu.size(0)):
+                t_mat_comp = t_mat_cpu[i, :, :]
+                evals, _ = t_mat_comp.symeig()
+                if min(evals) < -1e-4:
+                    comp_last_proper = max(slq.binary_search_symeig(t_mat_comp), 1)
+                    last_proper = min(comp_last_proper, last_proper)
+
+            # Do cholesky decomposition
+            t_mat_chol = tridiag_batch_potrf(t_mat[:, :last_proper, :last_proper], upper=False)
+
+            # Store q_mat * t_mat_chol
+            res = q_mat.new(*q_mat.size()).zero_()
+            torch.matmul(q_mat[:, :, :last_proper], t_mat_chol, out=res[:, :, :last_proper])
+            self.__q_mat = q_mat
+            self.__t_mat_chol = t_mat_chol
+
+            self.save_for_backward(*args)
+
+            if not is_batch:
+                res = res.squeeze(0)
+            return res
+
+        def backward(self, grad_output):
+            # Taken from http://homepages.inf.ed.ac.uk/imurray2/pub/16choldiff/choldiff.pdf
+            if any(self.needs_input_grad):
+                args = self.saved_tensors
+                q_mat = self.__q_mat
+                t_mat_chol = self.__t_mat_chol
+
+                if grad_output.ndimension() == 2:
+                    grad_output = grad_output.unsqueeze(0)
+                t_mat_chol_t = t_mat_chol.transpose(-1, -2)
+                q_mat_t = q_mat.transpose(-1, -2)
+
+                root_inverse = t_mat_chol_t.matmul(tridiag_batch_potrs(q_mat_t, t_mat_chol, upper=False))
+
+                # inside = phi(grad_output^T root)
+                # phi_ij (A) = 0 if i > j
+                # phi_ij (A) = 1/2 A_ij if i = j
+                # phi_ij (A) = A_ij if i < j
+                inside = torch.matmul(q_mat, t_mat_chol).transpose(-1, -2).matmul(grad_output)
+                phi_mask = inside.new(inside.size(-2), inside.size(-1)).fill_(1).tril_()
+                phi_mask.sub_(inside.new(inside.size(-1)).fill_(0.5).diag())
+                inside = inside * phi_mask.unsqueeze(0)
+
+                right_factor = inside.matmul(root_inverse)
+                left_factor = root_inverse
+
+                # S = root^-T phi(grad_output^T root) root^-1
+                res_1 = derivative_quadratic_form_factory(*args)(left_factor, right_factor)
+                res_2 = derivative_quadratic_form_factory(*args)(right_factor, left_factor)
+
+                # res = (S + S^T) / 2
+                res = tuple((comp_1 + comp_2).div_(2.) if comp_1 is not None and comp_2 is not None else None
+                            for comp_1, comp_2 in zip(res_1, res_2))
+                return res
+
+            else:
+                pass
+
+    return RootDecomposition

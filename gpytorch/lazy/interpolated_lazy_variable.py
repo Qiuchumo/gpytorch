@@ -250,15 +250,6 @@ class InterpolatedLazyVariable(LazyVariable):
         res = (interp_values * base_var_vals).sum(-1).sum(-1)
         return res
 
-    def chol_approx_size(self):
-        return self.base_lazy_variable.chol_approx_size()
-
-    def chol_matmul(self, tensor):
-        # Assumes the tensor is symmetric
-        res = self.base_lazy_variable.chol_matmul(tensor)
-        res = left_interp(self.left_interp_indices, self.left_interp_values, res)
-        return res
-
     def matmul(self, tensor):
         # We're using a custom matmul here, because it is significantly faster than
         # what we get from the function factory.
